@@ -1,7 +1,26 @@
-/.terraform
-/.terraform.lock.hcl
-/.vscode
-/terraform.tfstate
-/terraform.tfstate.1772128804.backup
-/terraform.tfstate.1772131960.backup
-/terraform.tfstate.backup
+# --- Terraform Generic Catch-alls ---
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# --- Variables & Secrets (Broad Patterns) ---
+*.tfvars
+*.tfvars.json
+*.tfplan
+
+# --- Credential Catch-alls ---
+*.json
+*.pem
+*.key
+*.p12
+
+# --- Environment & Local Config ---
+.env
+.env*
+.envrc
+
+# --- System & IDE ---
+.DS_Store
+.vscode/
+.idea/
