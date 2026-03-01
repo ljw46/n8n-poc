@@ -1,0 +1,7 @@
+/.terraform
+/.terraform.lock.hcl
+/.vscode
+/terraform.tfstate
+/terraform.tfstate.1772128804.backup
+/terraform.tfstate.1772131960.backup
+/terraform.tfstate.backup

@@ -1,0 +1,230 @@
+# 1. Variables & Provider
+variable "project_id"  { default = "myprojectid" }
+variable "region"      { default = "us-central1" }
+variable "db_password" { type = string } 
+variable "n8n_encryption_key" { 
+  type      = string 
+  sensitive = true 
+}
+variable "n8n_URL" {default = "https://enterurlhere.com/"}
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# -----------------------------------------------------------------------------------
+# 2. Enable APIs
+# -----------------------------------------------------------------------------------
+resource "google_project_service" "gcp_services" {
+  for_each = toset([
+    "secretmanager.googleapis.com",
+    "sqladmin.googleapis.com",
+    "run.googleapis.com"
+  ])
+  service            = each.key
+  disable_on_destroy = false
+}
+
+# -----------------------------------------------------------------------------------
+# 3. Identity & Secrets
+# -----------------------------------------------------------------------------------
+resource "google_service_account" "n8n_sa" {
+  account_id = "n8n-runner"
+  depends_on = [google_project_service.gcp_services]
+}
+
+resource "google_secret_manager_secret" "db_password" {
+  secret_id  = "n8n-db-password"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.gcp_services]
+}
+
+resource "google_secret_manager_secret_version" "db_password_val" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = var.db_password
+}
+
+resource "google_secret_manager_secret" "n8n_enc_key" {
+  secret_id  = "n8n-encryption-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.gcp_services]
+}
+
+resource "google_secret_manager_secret_version" "n8n_enc_key_val" {
+  secret      = google_secret_manager_secret.n8n_enc_key.id
+  secret_data = var.n8n_encryption_key 
+}
+
+# -----------------------------------------------------------------------------------
+# 4. Database (Cloud SQL)
+# -----------------------------------------------------------------------------------
+resource "google_sql_database_instance" "n8n_db" {
+  name             = "n8n-db"
+  database_version = "POSTGRES_14"
+  region           = var.region
+  settings {
+    tier      = "db-f1-micro"
+    disk_size = 10
+  }
+  deletion_protection = false
+  depends_on          = [google_project_service.gcp_services]
+}
+
+resource "google_sql_user" "n8n_user" {
+  name     = "n8n_user"
+  instance = google_sql_database_instance.n8n_db.name
+  password = var.db_password
+}
+resource "google_sql_database" "n8n_db_schema" {
+  name     = "n8n"
+  instance = google_sql_database_instance.n8n_db.name
+}
+# -----------------------------------------------------------------------------------
+# 5. IAM Permissions
+# -----------------------------------------------------------------------------------
+
+resource "google_project_iam_member" "sql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.n8n_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "db_access" {
+  secret_id = google_secret_manager_secret.db_password.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.n8n_sa.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "key_access" {
+  secret_id = google_secret_manager_secret.n8n_enc_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.n8n_sa.email}"
+}
+
+# -----------------------------------------------------------------------------------
+# 6. Cloud Run
+# -----------------------------------------------------------------------------------
+resource "google_cloud_run_v2_service" "n8n" {
+  name     = "n8n-serverless"
+  location = var.region
+  deletion_protection = false
+
+  scaling {
+      min_instance_count = 0 # Should be set to 1 in Prod to allow schedule tasks etc
+      max_instance_count = 5
+    }
+
+  template {
+    
+    labels = {
+      "deployment-heartbeat" = formatdate("YYYYMMDDHHmmss", timestamp())
+    }
+    service_account = google_service_account.n8n_sa.email
+    timeout = "300s"
+    
+    containers {
+      image = "n8nio/n8n:latest"
+      ports {
+        container_port = 5678
+      }
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "2Gi"
+        }
+        cpu_idle = true # consider false in prod to avoid scheduled task issues
+        startup_cpu_boost = true # needs this on startup to avoid cold start issues
+      }
+      
+      env {
+        name  = "N8N_PORT"
+        value = "5678"
+      }
+      env {
+        name  = "DB_POSTGRESDB_PORT"
+        value = "5432" 
+      }
+      env {
+        name  = "N8N_PROTOCOL"
+        value = "https"
+      }      
+      env {
+        name  = "WEBHOOK_URL"
+        value = var.n8n_URL # URL will be autogenerated by cloud run on initial build - update this env variable and rerun to avoid circular ref
+          }
+      env {
+        name  = "DB_TYPE"
+        value = "postgresdb"
+      }
+      env {
+        name  = "DB_POSTGRESDB_DATABASE"
+        value = "n8n"
+      }
+      env {
+        name  = "DB_POSTGRESDB_USER"
+        value = "n8n_user"
+      }
+      env {
+        name  = "DB_POSTGRESDB_HOST"
+        value = "/cloudsql/${var.project_id}:${var.region}:n8n-db"
+      }
+      env {
+        name = "DB_POSTGRESDB_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.db_password.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "N8N_ENCRYPTION_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.n8n_enc_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
+    }
+
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.n8n_db.connection_name]
+      }
+    }
+  }
+
+  depends_on = [
+    google_sql_database.n8n_db_schema,
+    google_sql_user.n8n_user,
+    google_secret_manager_secret_version.db_password_val,
+    google_secret_manager_secret_version.n8n_enc_key_val
+  ]
+  lifecycle {
+    ignore_changes = [
+      template[0].revision,
+    ]
+  }
+}
+
+resource "google_cloud_run_v2_service_iam_member" "public_access" {
+  name     = google_cloud_run_v2_service.n8n.name
+  location = google_cloud_run_v2_service.n8n.location
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+output "n8n_url" {
+  value = google_cloud_run_v2_service.n8n.uri
+}
